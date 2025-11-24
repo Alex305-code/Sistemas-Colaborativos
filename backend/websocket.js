@@ -1,94 +1,81 @@
-// websocket.js
-const WebSocket = require('ws');
-const jwt = require('jsonwebtoken');
-const Message = require('./models/Message');
+// backend/websocket.js
+import { WebSocketServer } from "ws";
+import Message from "./models/Message.js";
 
 let wss;
 const clients = new Map(); // ws -> { username, email }
 
-function setupWebSocket(server) {
-  wss = new WebSocket.Server({ server, path: '/ws' });
+export function setupWebSocket(server) {
+  // El path debe coincidir con el que usas en el frontend: ws://localhost:4000/ws
+  wss = new WebSocketServer({ server, path: "/ws" });
 
-  wss.on('connection', (ws, req) => {
-    console.log('🔗 Nueva conexión WebSocket');
+  wss.on("connection", (ws, req) => {
+    console.log("🔗 Cliente conectado");
 
-    // Leer token desde query: ws://localhost:4000/ws?token=...
-    const params = new URLSearchParams(req.url.split('?')[1]);
-    const token = params.get('token');
+    // Leemos username y email desde la URL: ?username=...&email=...
+    const params = new URLSearchParams(req.url.split("?")[1] || "");
+    const username = params.get("username") || "Anónimo";
+    const email = params.get("email") || "";
 
-    if (!token) {
-      ws.close();
-      return;
-    }
+    // Guardamos info del cliente
+    clients.set(ws, { username, email });
 
-    let user;
-    try {
-      user = jwt.verify(token, process.env.JWT_SECRET);
-    } catch (err) {
-      ws.close();
-      return;
-    }
-
-    clients.set(ws, { username: user.username, email: user.email });
-
-    // Notificar a todos que un usuario se unió
+    // Avisamos a todos que alguien entró
     broadcast({
-      type: 'user_joined',
-      username: user.username,
-      message: `${user.username} se ha unido al chat`,
+      type: "user_joined",
+      username,
     });
 
-    ws.on('message', async (data) => {
+    ws.on("message", async (data) => {
       try {
         const msg = JSON.parse(data);
 
-        if (msg.type === 'chat_message') {
+        if (msg.type === "chat_message") {
           const payload = {
-            type: 'new_message',
-            username: user.username,
+            type: "new_message",
+            username,
             text: msg.text,
             createdAt: new Date().toISOString(),
           };
 
           // Guardar en MongoDB
           await Message.create({
-            username: user.username,
+            username,
+            email,
             text: msg.text,
           });
 
+          // Enviar a todos los conectados
           broadcast(payload);
         }
       } catch (err) {
-        console.error('Error al procesar mensaje WS:', err.message);
+        console.error("❌ Error procesando mensaje WS:", err);
       }
     });
 
-    ws.on('close', () => {
-      const userInfo = clients.get(ws);
+    ws.on("close", () => {
+      const info = clients.get(ws);
       clients.delete(ws);
 
-      if (userInfo) {
+      if (info) {
         broadcast({
-          type: 'user_left',
-          username: userInfo.username,
-          message: `${userInfo.username} salió del chat`,
+          type: "user_left",
+          username: info.username,
         });
       }
-      console.log('🔌 Cliente desconectado');
+
+      console.log("🔌 Cliente desconectado");
     });
   });
 }
 
-// Enviar mensaje a todos los clientes conectados
-function broadcast(obj) {
+export function broadcast(obj) {
   if (!wss) return;
-
   const data = JSON.stringify(obj);
+
   wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) {
+    if (client.readyState === 1) {
       client.send(data);
     }
   });
 }
-
-module.exports = { setupWebSocket, broadcast };

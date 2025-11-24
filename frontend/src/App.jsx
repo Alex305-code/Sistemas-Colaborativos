@@ -1,11 +1,40 @@
-import React, { useState } from "react";
+// src/App.jsx
+import React, { useState, useEffect, useRef } from "react";
 import { auth, googleProvider } from "./firebase";
 import {
   signInWithPopup,
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
   updateProfile,
+  signOut,
+  onAuthStateChanged,
 } from "firebase/auth";
+
+const API_BASE = "http://localhost:4000"; // backend
+
+async function syncUserWithBackend(firebaseUser) {
+  if (!firebaseUser) return;
+
+  try {
+    await fetch(`${API_BASE}/api/users/sync`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        firebaseUid: firebaseUser.uid,
+        displayName: firebaseUser.displayName,
+        email: firebaseUser.email,
+        photoURL: firebaseUser.photoURL,
+        provider:
+          (firebaseUser.providerData &&
+            firebaseUser.providerData[0] &&
+            firebaseUser.providerData[0].providerId) ||
+          "password",
+      }),
+    });
+  } catch (err) {
+    console.error("❌ No se pudo guardar el usuario en Mongo:", err);
+  }
+}
 
 function App() {
   const [mode, setMode] = useState("login"); // "login" | "register"
@@ -15,8 +44,20 @@ function App() {
   const [confirm, setConfirm] = useState("");
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState("");
+  const [user, setUser] = useState(null); // usuario autenticado
+  const [checkingAuth, setCheckingAuth] = useState(true); // mientras Firebase responde
 
   const isLogin = mode === "login";
+
+  // Escuchar sesión de Firebase (login / logout / refresh)
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
+      setUser(firebaseUser);
+      setCheckingAuth(false);
+    });
+
+    return () => unsubscribe();
+  }, []);
 
   const resetForm = () => {
     setFullName("");
@@ -38,10 +79,12 @@ function App() {
 
     try {
       if (isLogin) {
+        // INICIAR SESIÓN CON CORREO
         const res = await signInWithEmailAndPassword(auth, email, password);
+        await syncUserWithBackend(res.user); // ⬅️ GUARDAR EN MONGO
         alert(`Bienvenido, ${res.user.displayName || res.user.email}`);
-        // aquí luego rediriges al chat
       } else {
+        // REGISTRO
         if (password !== confirm) {
           setErrorMsg("Las contraseñas no coinciden.");
           setLoading(false);
@@ -58,36 +101,71 @@ function App() {
           await updateProfile(cred.user, { displayName: fullName.trim() });
         }
 
+        // guardar en Mongo
+        await syncUserWithBackend({
+          ...cred.user,
+          displayName: fullName.trim() || cred.user.displayName,
+        });
+
         alert("Cuenta creada correctamente. Ahora puedes iniciar sesión.");
         handleModeChange("login");
       }
     } catch (err) {
       console.error(err);
-      setErrorMsg(err.message || "Ocurrió un error. Intenta nuevamente.");
+      setErrorMsg(
+        err.message || "Ocurrió un error al procesar tu solicitud."
+      );
     } finally {
       setLoading(false);
     }
   };
 
-  const handleGoogleAuth = async () => {
+  // LOGIN CON GOOGLE
+  const call_login_google = async () => {
     setErrorMsg("");
     setLoading(true);
     try {
       const result = await signInWithPopup(auth, googleProvider);
-      alert(
-        `Sesión iniciada como ${
-          result.user.displayName || result.user.email
-        }`
-      );
-      // aquí luego rediriges al chat
-    } catch (err) {
-      console.error(err);
+
+      const user = result.user;
+      console.log("Usuario Google:", user);
+
+      await syncUserWithBackend(user); // ⬅️ GUARDAR EN MONGO
+
+      alert(`Sesión iniciada como ${user.displayName || user.email}`);
+    } catch (error) {
+      console.error("Error Google Login:", error);
       setErrorMsg("No se pudo iniciar sesión con Google.");
     } finally {
       setLoading(false);
     }
   };
 
+  // Cerrar sesión
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+    } catch (err) {
+      console.error("Error al cerrar sesión:", err);
+    }
+  };
+
+  // Mientras se verifica si hay sesión
+  if (checkingAuth) {
+    return (
+      <div className="loading-screen">
+        <div className="loading-spinner" />
+        <p>Cargando sesión...</p>
+      </div>
+    );
+  }
+
+  // Si hay usuario logueado → Chat
+  if (user) {
+    return <ChatLayout user={user} onLogout={handleLogout} />;
+  }
+
+  // Si NO hay usuario → Login / Registro
   return (
     <main className="app-shell">
       {/* Panel izquierdo */}
@@ -227,11 +305,7 @@ function App() {
             </div>
           )}
 
-          <button
-            type="submit"
-            className="primary-btn"
-            disabled={loading}
-          >
+          <button type="submit" className="primary-btn" disabled={loading}>
             {loading
               ? "Procesando..."
               : isLogin
@@ -251,7 +325,7 @@ function App() {
         <button
           type="button"
           className="google-btn"
-          onClick={handleGoogleAuth}
+          onClick={call_login_google}
           disabled={loading}
         >
           <span className="google-icon">G</span>
@@ -259,12 +333,165 @@ function App() {
         </button>
 
         <p className="auth-footer">
-          Autenticación gestionada por Firebase.  
+          Autenticación gestionada por Firebase. <br />
           Al continuar aceptas el uso académico de tu información básica de
           perfil.
         </p>
       </section>
     </main>
+  );
+}
+
+/* =======================
+   Layout del Chat con WebSocket
+   ======================= */
+
+function ChatLayout({ user, onLogout }) {
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState("");
+  const socketRef = useRef(null);
+
+  const displayName = user.displayName || user.email || "Usuario";
+
+  // Conectar WebSocket al montar el componente
+  useEffect(() => {
+    const username = encodeURIComponent(displayName);
+    const email = encodeURIComponent(user.email || "");
+
+    const socket = new WebSocket(
+      `ws://localhost:4000/ws?username=${username}&email=${email}`
+    );
+
+    socketRef.current = socket;
+
+    socket.addEventListener("open", () => {
+      console.log("🔗 WebSocket conectado");
+    });
+
+    socket.addEventListener("message", (event) => {
+      try {
+        const data = JSON.parse(event.data);
+
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}-${Math.random()}`,
+            ...data,
+          },
+        ]);
+      } catch (err) {
+        console.error("Error al parsear mensaje del servidor:", err);
+      }
+    });
+
+    socket.addEventListener("close", () => {
+      console.log("🔌 WebSocket cerrado");
+    });
+
+    socket.addEventListener("error", (err) => {
+      console.error("❌ Error WebSocket:", err);
+    });
+
+    return () => {
+      if (socketRef.current) {
+        socketRef.current.close();
+      }
+    };
+  }, [displayName, user.email]);
+
+  // Enviar mensaje al servidor
+  const handleSendMessage = (e) => {
+    e.preventDefault();
+    const text = input.trim();
+    if (!text) return;
+
+    if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) {
+      alert("La conexión con el servidor no está disponible.");
+      return;
+    }
+
+    const msg = {
+      type: "chat_message",
+      text,
+    };
+
+    socketRef.current.send(JSON.stringify(msg));
+    setInput("");
+  };
+
+  const formatTime = (ts) => {
+    const d = new Date(ts || Date.now());
+    return d.toLocaleTimeString("es-PE", {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  };
+
+  return (
+    <div className="chat-shell">
+      <aside className="chat-sidebar">
+        <div className="chat-logo">💬 Siscolab</div>
+        <div className="chat-user">
+          <div className="avatar">
+            {user.photoURL ? (
+              <img src={user.photoURL} alt="avatar" />
+            ) : (
+              displayName[0].toUpperCase()
+            )}
+          </div>
+          <div className="user-info">
+            <strong>{displayName}</strong>
+            <span>{user.email}</span>
+          </div>
+        </div>
+
+        <button className="logout-btn" onClick={onLogout}>
+          Cerrar sesión
+        </button>
+      </aside>
+
+      <main className="chat-main">
+        <header className="chat-header">
+          <h2># general</h2>
+          <p>Canal principal del chat colaborativo</p>
+        </header>
+
+        <section className="chat-messages">
+          {messages.map((msg) => (
+            <div key={msg.id} className="chat-message">
+              {/* Mensajes del sistema */}
+              {(msg.type === "user_joined" || msg.type === "user_left") && (
+                <div className="msg-text" style={{ fontSize: 12, opacity: 0.8 }}>
+                  {msg.message ||
+                    (msg.type === "user_joined"
+                      ? `${msg.username} se ha conectado`
+                      : `${msg.username} se ha desconectado`)}
+                </div>
+              )}
+
+              {/* Mensajes normales */}
+              {msg.type === "new_message" && (
+                <>
+                  <div className="msg-author">{msg.username}</div>
+                  <div className="msg-text">{msg.text}</div>
+                  <div className="msg-time">{formatTime(msg.createdAt)}</div>
+                </>
+              )}
+            </div>
+          ))}
+        </section>
+
+        <form className="chat-input-bar" onSubmit={handleSendMessage}>
+          <input
+            type="text"
+            placeholder="Escribe un mensaje..."
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+          />
+          <button type="submit">Enviar</button>
+        </form>
+      </main>
+    </div>
   );
 }
 
