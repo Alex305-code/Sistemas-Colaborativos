@@ -16,23 +16,34 @@ async function syncUserWithBackend(firebaseUser) {
   if (!firebaseUser) return;
 
   try {
-    await fetch(`${API_BASE}/api/users/sync`, {
+    const reqBody = {
+      firebaseUid: firebaseUser.uid,
+      displayName: firebaseUser.displayName,
+      email: firebaseUser.email,
+      photoURL: firebaseUser.photoURL,
+      provider:
+        (firebaseUser.providerData &&
+          firebaseUser.providerData[0] &&
+          firebaseUser.providerData[0].providerId) ||
+        "password",
+    };
+
+    console.log("📤 Enviando datos al backend:", reqBody); // Para depurar
+
+    const res = await fetch(`${API_BASE}/api/users/sync`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        firebaseUid: firebaseUser.uid,
-        displayName: firebaseUser.displayName,
-        email: firebaseUser.email,
-        photoURL: firebaseUser.photoURL,
-        provider:
-          (firebaseUser.providerData &&
-            firebaseUser.providerData[0] &&
-            firebaseUser.providerData[0].providerId) ||
-          "password",
-      }),
+      body: JSON.stringify(reqBody),
     });
+
+    if (res.ok) {
+      console.log("✅ Usuario sincronizado con MongoDB");
+    } else {
+      const errorData = await res.text();
+      console.error("❌ Error del Backend:", res.status, errorData);
+    }
   } catch (err) {
-    console.error("❌ No se pudo guardar el usuario en Mongo:", err);
+    console.error("❌ No se pudo conectar con el servidor:", err);
   }
 }
 
@@ -91,21 +102,15 @@ function App() {
           return;
         }
 
-        const cred = await createUserWithEmailAndPassword(
-          auth,
-          email,
-          password
-        );
+        const cred = await createUserWithEmailAndPassword(auth, email, password);
 
         if (fullName.trim()) {
           await updateProfile(cred.user, { displayName: fullName.trim() });
+          await cred.user.reload();
         }
 
         // guardar en Mongo
-        await syncUserWithBackend({
-          ...cred.user,
-          displayName: fullName.trim() || cred.user.displayName,
-        });
+        await syncUserWithBackend(cred.user);
 
         alert("Cuenta creada correctamente. Ahora puedes iniciar sesión.");
         handleModeChange("login");
